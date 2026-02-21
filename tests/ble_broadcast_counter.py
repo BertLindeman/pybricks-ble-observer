@@ -4,6 +4,8 @@ broadcast_interval = 100
 
 from pybricks.hubs import ThisHub
 from pybricks.tools import wait, StopWatch
+from pybricks.parameters import Color 
+
 hub = ThisHub(broadcast_channel=5)
 watch = StopWatch()
 print('ble_broadcast_counter')
@@ -17,4 +19,12 @@ while True:
         counter = 1
     watch.reset()
     hub.ble.broadcast(counter)
+
+    # Hub light will be RED if connected to a PC via bluetooth.
+    # After disconnect (it takes a few seconds) the light goes to GREEN.
+    if hub.system.info()['host_connected_ble']:
+        hub.light.on(Color.RED)  # show RED if connected
+    else:
+        hub.light.on(Color.GREEN)
+    
     wait(broadcast_interval - watch.time())
