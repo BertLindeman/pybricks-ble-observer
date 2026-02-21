@@ -20,6 +20,7 @@ added to the data.
            and scan response handling stays out of the hot path.
            This might handle 10 hubs at 250ms and likely at 100ms too.
 """
+__version__ = "1.0.0"
 
 # --- Performance notes ---
 #
@@ -608,8 +609,8 @@ _last_irq_count = [0]   # snapshot of _irq_count at last watchdog/preventive che
 # Start scanning
 # gap_scan(duration_ms, interval_us, window_us, active)
 ble.gap_scan(SCAN_DURATION_MS, SCAN_INTERVAL_US, SCAN_WINDOW_US, SCAN_ACTIVE)
-
-print(f"Scanning for Pybricks BLE advertisements (Ctrl-C to stop)  "
+print(f"pybricks-ble-observer v{__version__}  "
+      f"Scanning for Pybricks BLE advertisements (Ctrl-C to stop)  "
       f"[dedup={'on' if SUPPRESS_DUPLICATES else 'off'}  "
       f"theme={COLOR_THEME}  debug={'on' if DEBUG else 'off'}]")
 
