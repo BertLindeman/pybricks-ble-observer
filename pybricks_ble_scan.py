@@ -19,8 +19,11 @@ added to the data.
            address string formatting happens once per hub instead of once per packet,
            and scan response handling stays out of the hot path.
            This might handle 10 hubs at 250ms and likely at 100ms too.
+
+2026-02-22 BL update for pylint and flake8
+
 """
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 # --- Performance notes ---
 #
@@ -60,13 +63,17 @@ __version__ = "1.0.0"
 
 import struct
 import time
-import bluetooth
 from collections import deque
+import bluetooth
 
 # --- Configuration - these to tune the program ---
 
-# Set to True to only print a line when the value actually changes.
-# Set to False to print every single packet received (can be a lot!).
+# BLE devices transmit each advertisement multiple times per broadcast interval
+# across different radio channels to improve reliability.
+# This means the observer typically receives 4-6 copies of each value per broadcast.
+# SUPPRESS_DUPLICATES filters these retransmissions
+# — only printing when the value actually changes on a given channel. 
+# Set to False to see every reception including duplicates.
 SUPPRESS_DUPLICATES = True
 
 # Color theme for the hub address in the terminal output.
@@ -80,11 +87,34 @@ SCAN_DURATION_MS = 0
 
 # interval_us is how often a scan window starts (in microseconds).
 # window_us is how long each scan window lasts.
-# 25% duty cycle (window = quarter of interval) keeps the BLE chip's
-# internal event buffer from filling up under heavy traffic.
-# Hubs broadcast repeatedly so we won't miss data at this duty cycle.
+# BLE scan parameters — these control how the radio scans for packets.
+# duration_ms = 0 means scan forever (until we press Ctrl-C).
+SCAN_DURATION_MS = 0
+
+# interval_us is how often a scan window starts (in microseconds).
+# window_us is how long each scan window lasts.
+#
+# Duty cycle = window / interval.
+# Examples:
+#   25% duty cycle: SCAN_WINDOW_US = 25000  — light load, misses ~75% of packets
+#   50% duty cycle: SCAN_WINDOW_US = 50000  — good balance for multi-hub use
+#   75% duty cycle: SCAN_WINDOW_US = 75000  — catches most packets, higher BLE buffer pressure
+#  100% duty cycle: SCAN_WINDOW_US = 100000 — continuous listen, maximum packet capture
+#
+# At 25% duty cycle with a hub broadcasting every 100ms, roughly 1 in 4
+# packets is received — gaps in a counter sequence are normal and expected.
+#
+# Higher duty cycles increase the rate at which the BLE chip's internal
+# event buffer fills. The preventive restart (PREVENTIVE_RESTART_EVENTS)
+# handles this, but will fire more frequently at higher duty cycles.
+#
 SCAN_INTERVAL_US = 100000   # 100 ms
-SCAN_WINDOW_US   = 25000    # 25 ms  (25% duty cycle)
+#
+# Recommended starting points:
+# SCAN_WINDOW_US = 25000      #  25 ms Many hubs, heavy traffic     (25% duty cycle)
+SCAN_WINDOW_US = 50000      #  50 ms Multi-hub, balanced          (50% duty cycle)
+# SCAN_WINDOW_US = 75000      #  75 ms Multi-hub, possible hangups  (75% duty cycle)
+# SCAN_WINDOW_US = 100000     # 100 ms Single hub, max capture     (100% duty cycle)
 
 # active=False means we just listen — we never send scan requests back.
 # This is called passive scanning. We don't want to talk, just observe.
@@ -99,16 +129,16 @@ WATCHDOG_SEC = 10
 # flush the BLE chip's internal event buffer before it fills up and stalls.
 # Set to 0 to disable.
 
-PREVENTIVE_RESTART_EVENTS = 6000    # was 120 — at ~120 IRQ events/sec ambient noise
-                                 # 120 caused restarts every ~1s, colliding with
-                                 # hub boot-time name packets. 6000 ≈ 50s between
-                                 # restarts, giving hubs time to send their name.
+PREVENTIVE_RESTART_EVENTS = 6000    # was 6000 on 100% duty-cycle - too high. On 50% OK
+# at ~120 IRQ events/sec ambient noise caused restarts every ~1s,
+# colliding with hub boot-time name packets.
+# 6000 ≈ 50s between restarts, giving hubs time to send their name.
+# If using higher duty-cycle (with SCAN_WINDOW_US above) it may be needed 
+# to lower PREVENTIVE_RESTART_EVENTS significally.
 
 # Debug mode: show heartbeat, watchdog, and restart messages.
 # Set to False for clean output with data lines only.
 DEBUG = True
-
-DEBUG_RESTART = True  # Print message if scan has been restarted
 
 # How often (in seconds) to print a heartbeat status line (when DEBUG==True).
 HEARTBEAT_SEC = 30
@@ -148,7 +178,7 @@ RSSI_LEVELS = [
     (-70, "Nearby    "),   # same room
     (-80, "Far       "),   # across room
 ]
-RSSI_WEAK   =  "Weak      "   # below all thresholds
+RSSI_WEAK = "Weak      "   # below all thresholds
 
 # --- ANSI terminal color codes ---
 # These are special escape sequences that tell the terminal to change
@@ -184,17 +214,17 @@ COLORS_LIGHT = [
 ]
 
 ANSI_RESET = "\x1b[0m"
-COLORS     = COLORS_DARK if COLOR_THEME == "dark" else COLORS_LIGHT
+COLORS = COLORS_DARK if COLOR_THEME == "dark" else COLORS_LIGHT
 
 # --- Hub registry ---
 # We keep a dictionary that maps each hub's BLE address to its
 # assigned letter tag and color. New hubs get the next available slot.
 _hub_registry = {}   # address string -> (tag letter, ansi color string)
 _name_cache = {}     # addr_bytes -> name, for scan responses arriving before
-                     # the first manufacturer packet from that address.
-                     # Entries are promoted to _hub_registry on first Pybricks packet.
+#                      the first manufacturer packet from that address.
+#                      Entries are promoted to _hub_registry on first Pybricks packet.
 
-_hub_counter  = [0]  # wrapped in a list so the IRQ function can modify it
+_hub_counter = [0]   # wrapped in a list so the IRQ function can modify it
 
 # --- Deduplication state ---
 # For each (address, channel) pair we remember the last value we printed.
@@ -215,12 +245,11 @@ _queue = deque((), 180)   # was  maxlen=60, IRQ just appends — overflow drops 
 # Wrapped in single-element lists because Python closures can read outer
 # variables but not reassign them — using a list lets us do _count[0] += 1
 # from inside the IRQ function without a 'global' declaration.
-_irq_count   = [0]   # how many BLE events the IRQ received in total
-_queue_count = [0]   # how many of those were Pybricks packets we queued
-_print_count = [0]   # how many lines we actually printed to the terminal
-_t_start     = time.ticks_ms()   # program start time for elapsed display
-_drop_count  = [0]   # packets lost to deque overflow (queue was full)
-_processed_count = [0]
+_irq_count = [0]              # how many BLE events the IRQ received in total
+_queue_count = [0]            # how many of those were Pybricks packets we queued
+_print_count = [0]            # how many lines we actually printed to the terminal
+_t_start = time.ticks_ms()    # program start time for elapsed display
+_processed_count = [0]        # how many packets are processed
 _intentional_restart = False
 
 
@@ -230,14 +259,14 @@ def rssi_label(dbm):
     Thresholds are defined in RSSI_LEVELS; anything below the last
     threshold is returned as RSSI_WEAK.
     """
-    for threshold, label in RSSI_LEVELS:
-        if dbm >= threshold:
-            return label
+    for _threshold, _label in RSSI_LEVELS:
+        if dbm >= _threshold:
+            return _label
     return RSSI_WEAK
 
 
 # In hub_tag_color — cache addr_string, add name slot
-def hub_tag_color(addr):
+def hub_tag_color(addr_):
     """
     Look up or assign a letter tag, color, and cached address string for a hub.
     The first hub we see gets tag 'A' and the first color, the second 'B', etc.
@@ -246,56 +275,56 @@ def hub_tag_color(addr):
     — addr_str() is a string join and is not free to repeat 40 times per second.
     RSSI EMA and hub name are initialised to None on first sight.
     """
-    if addr not in _hub_registry:
-        idx        = _hub_counter[0] % len(COLORS)
-        tag        = chr(ord('A') + (_hub_counter[0] % 26))
-        addr_s     = addr_str(addr)
-        #                      tag  color        ema   name  addr_string
-        _hub_registry[addr] = (tag, COLORS[idx], None, None, addr_s)
+    if addr_ not in _hub_registry:
+        idx = _hub_counter[0] % len(COLORS)
+        tag_ = chr(ord('A') + (_hub_counter[0] % 26))
+        addr_s_ = addr_str(addr_)
+        #                       tag   color        ema   name  addr_string
+        _hub_registry[addr_] = (tag_, COLORS[idx], None, None, addr_s_)
         _hub_counter[0] += 1
-    return _hub_registry[addr]
+    return _hub_registry[addr_]
 
 
 # update_rssi_ema — match new tuple shape
-def update_rssi_ema(addr, rssi):
+def update_rssi_ema(addr_, rssi_):
     """
     Update the exponential moving average RSSI for a hub.
     On first packet the EMA is seeded with the raw reading.
     Returns the updated EMA value.
     """
-    tag, color, ema, name, addr_s = _hub_registry[addr]
-    ema = rssi if ema is None else RSSI_EMA_ALPHA * rssi + (1 - RSSI_EMA_ALPHA) * ema
-    _hub_registry[addr] = (tag, color, ema, name, addr_s)
-    return ema
+    tag_, color_, ema_, name_, addr_s_ = _hub_registry[addr_]
+    ema_ = rssi_ if ema_ is None else RSSI_EMA_ALPHA * rssi_ + (1 - RSSI_EMA_ALPHA) * ema_
+    _hub_registry[addr_] = (tag_, color_, ema_, name_, addr_s_)
+    return ema_
 
 
-def update_hub_name(addr, name):
+def update_hub_name(addr_, name_):
     """
     Store the hub's friendly name once we receive it in a scan response.
     Once set it is never overwritten — the name is stable for a hub's session.
     """
-    tag, color, ema, existing, addr_s = _hub_registry[addr]
-    if existing is None and name:
-        _hub_registry[addr] = (tag, color, ema, name, addr_s)
+    tag_, color_, ema_, _existing, addr_s_ = _hub_registry[addr_]
+    if _existing is None and name_:
+        _hub_registry[addr_] = (tag_, color_, ema_, name_, addr_s_)
 
 
 # --- Pybricks value type encoding constants ---
 # The top 3 bits of the header byte select the type.
 # The bottom 5 bits carry the data length (for variable-length types).
 _TYPE_MASK = 0b11100000
-_LEN_MASK  = 0b00011111
-_T_SINGLE  = 0 << 5   # 0x00
-_T_TRUE    = 1 << 5   # 0x20
-_T_FALSE   = 2 << 5   # 0x40
-_T_INT     = 3 << 5   # 0x60
-_T_FLOAT   = 4 << 5   # 0x80
-_T_STR     = 5 << 5   # 0xA0
-_T_BYTES   = 6 << 5   # 0xC0
+_LEN_MASK = 0b00011111
+_T_SINGLE = 0 << 5  # 0x00
+_T_TRUE = 1 << 5    # 0x20
+_T_FALSE = 2 << 5   # 0x40
+_T_INT = 3 << 5     # 0x60
+_T_FLOAT = 4 << 5   # 0x80
+_T_STR = 5 << 5     # 0xA0
+_T_BYTES = 6 << 5   # 0xC0
 
 
-def addr_str(addr):
+def addr_str(addr_):
     """Convert 6 raw address bytes into human-readable AA:BB:CC:DD:EE:FF format."""
-    return ":".join(f"{b:02X}" for b in reversed(addr))
+    return ":".join(f"{b:02X}" for b in reversed(addr_))
 
 
 def find_local_name(payload):
@@ -321,7 +350,7 @@ def find_local_name(payload):
         if payload[i] in (0x08, 0x09):      # shortened or complete local name
             try:
                 return payload[i + 1:i + length].decode("utf-8")
-            except Exception:
+            except Exception:  # pylint: disable=W0718
                 return None                 # malformed UTF-8, skip
         i += length                         # skip to next record
     return None                             # no name record found
@@ -360,78 +389,98 @@ def find_mfr_offset(payload):
     return -1                              # not found
 
 
-def decode_value(data, pos):
+_INT_FMTS = {1: ("<b", 1), 2: ("<h", 2), 4: ("<i", 4)}
+
+
+def _decode_int(data, pos, length):
+    fmt_size = _INT_FMTS.get(length)
+    if fmt_size is None:
+        return None, 0
+    fmt, size = fmt_size
+    if pos + size > len(data):
+        return None, 0
+    value, = struct.unpack_from(fmt, data, pos)
+    return value, size
+
+
+def _decode_float(data, pos):
+    if pos + 4 > len(data):
+        return None, 0
+    value, = struct.unpack_from("<f", data, pos)
+    return value, 4
+
+
+def _decode_str(data, pos, length):
+    if pos + length > len(data):
+        return None, 0
+    return data[pos:pos + length].decode("utf-8"), length
+
+
+def _decode_bytes(data, pos, length):
+    if pos + length > len(data):
+        return None, 0
+    return bytes(data[pos:pos + length]), length
+
+
+def decode_value(data, pos):  # pylint: disable=R0911 # (too-many-return-statements)
     """
     Decode one Pybricks-encoded value from 'data' starting at byte 'pos'.
     Returns (decoded_python_value, number_of_data_bytes_consumed).
     Returns (None, 0) if decoding fails.
+
+    Reworked due to "too many returns"
     """
     if pos >= len(data):
         return None, 0
-
     header = data[pos]
-    typ    = header & _TYPE_MASK   # top 3 bits = type
-    length = header & _LEN_MASK    # bottom 5 bits = data length
-    pos   += 1                     # move past the header byte
-
-    if typ == _T_SINGLE:
-        # SINGLE_OBJECT is just a wrapper — the real value follows immediately.
-        # Recurse to decode whatever comes next.
-        return decode_value(data, pos)
-
+    typ = header & _TYPE_MASK
+    length = header & _LEN_MASK
+    pos += 1
+    while typ == _T_SINGLE:
+        if pos >= len(data):
+            return None, 0
+        header = data[pos]
+        typ = header & _TYPE_MASK
+        length = header & _LEN_MASK
+        pos += 1
     if typ == _T_TRUE:
         return True, 0
-
     if typ == _T_FALSE:
         return False, 0
-
     if typ == _T_INT:
-        # Pick the right struct format based on the length field.
-        # '<' means little-endian (least significant byte first).
-        if length == 1:
-            fmt, size = "<b", 1   # signed 8-bit integer
-        elif length == 2:
-            fmt, size = "<h", 2   # signed 16-bit integer
-        elif length == 4:
-            fmt, size = "<i", 4   # signed 32-bit integer
-        else:
-            return None, 0        # unexpected length
-        if pos + size > len(data):
-            return None, 0        # not enough bytes left
-        value, = struct.unpack_from(fmt, data, pos)
-        return value, size
-
+        return _decode_int(data, pos, length)
     if typ == _T_FLOAT:
-        # IEEE 754 single-precision float, always 4 bytes little-endian.
-        if pos + 4 > len(data):
-            return None, 0
-        value, = struct.unpack_from("<f", data, pos)
-        return value, 4
-
+        return _decode_float(data, pos)
     if typ == _T_STR:
-        # UTF-8 string — length bytes of text, no zero terminator.
-        if pos + length > len(data):
-            return None, 0
-        return data[pos:pos + length].decode("utf-8"), length
-
+        return _decode_str(data, pos, length)
     if typ == _T_BYTES:
-        # Raw bytes — just return them as a bytes object.
-        if pos + length > len(data):
-            return None, 0
-        return bytes(data[pos:pos + length]), length
-
-    return None, 0   # unknown type
+        return _decode_bytes(data, pos, length)
+    return None, 0
 
 
 def print_detail_header():
+    """Print headerline"""
     print(f"{'secs':>8}  {'Address':<17} [T] {'Hub name':<12} ch {'Signal':<18} {'Value'}")
     print("-" * 70)
+
+
+def _format_decoded(value):
+    """Format helper for parse_pybricks"""
+    if value is None:
+        return "?"
+    if isinstance(value, bool):  # before int — bool subclasses int
+        return str(value)
+    if isinstance(value, float):
+        return f"{value:.6g}"
+    if isinstance(value, (bytes, bytearray)):
+        return value.hex()
+    return str(value)
 
 
 def parse_pybricks(payload):
     """
     Try to parse a BLE advertisement payload as a Pybricks broadcast packet.
-    Returns (channel, raw_data_bytes, decoded_string),
+    Returns (channel, decoded_string),
     or None if it is not a Pybricks packet.
     """
     # Find where the manufacturer data starts
@@ -449,31 +498,17 @@ def parse_pybricks(payload):
     # producing garbage values like 42751 (0xA6FF) or 25087 (0x61FF).
     company_id, channel = struct.unpack_from("<HB", payload, offset)
 
-
     # Ignore packets from other manufacturers
     if company_id != PYBRICKS_COMPANY_ID:
         return None
 
     # data starts after company_id (2 bytes) + channel (1 byte)
     data_start = offset + 3
-    data       = payload[data_start:]
+    data = payload[data_start:]
 
     value, _ = decode_value(data, 0)
 
-    # Format the decoded value as a string for display
-    if value is None:
-        decoded = "?"
-    elif isinstance(value, bool):
-        # Check bool before int — in Python, bool is a subclass of int!
-        decoded = str(value)
-    elif isinstance(value, float):
-        decoded = f"{value:.6g}"
-    elif isinstance(value, (bytes, bytearray)):
-        decoded = value.hex()
-    else:
-        decoded = str(value)
-
-    return channel, bytes(data), decoded
+    return channel, _format_decoded(value)
 
 
 def contains_pybricks_id(mv):
@@ -489,6 +524,22 @@ def contains_pybricks_id(mv):
     return False
 
 
+def _format_line(addr_bytes_, rssi_, channel_, decoded_):
+    """
+    Format one output line for process_queue.
+    Extracted as a module-level function so it is not reallocated
+    on every packet iteration — nested functions carry overhead on MicroPython.
+    Not intended for general use.
+    """
+    tag_, color_, _, name_, addr_s_ = _hub_registry[addr_bytes_]
+    ema_ = update_rssi_ema(addr_bytes_, rssi_)
+    signal_ = f"{rssi_label(ema_)} {int(ema_):4d}dBm"
+    elapsed_ = time.ticks_diff(time.ticks_ms(), _t_start) // 1000
+    colored_addr_ = f"{color_}{addr_s_}{ANSI_RESET}"
+    display_name_ = f" {name_}" if name_ else ""
+    return (f"{elapsed_:8d}s {colored_addr_} [{tag_}]{display_name_:<12}"
+            f" {channel_:>3} {signal_} {decoded_}")
+
 
 def process_queue():
     """
@@ -500,40 +551,29 @@ def process_queue():
     while _queue:
         _processed_count[0] += 1
         addr_bytes, payload, rssi, adv_type = _queue.popleft()
-        
+
         # Try to extract a local name from any packet type —
         # City and Technic hubs include it in regular advertisements too.
         # This fills in the name on the first packet without waiting for
         # a scan response, and covers hubs that don't send scan responses.
-        name = find_local_name(payload)
-        if name and addr_bytes in _hub_registry:
-            update_hub_name(addr_bytes, name)
 
-# ===================================================
+        name_ = find_local_name(payload)
         if adv_type == 4:
-            name = find_local_name(payload)
-            if name:
+            if name_:
                 if addr_bytes in _hub_registry:
-                    update_hub_name(addr_bytes, name)   # already known, store directly
+                    update_hub_name(addr_bytes, name_)   # already known, store directly
                 else:
-                    _name_cache[addr_bytes] = name      # hold until first packet arrives
+                    _name_cache[addr_bytes] = name_      # hold until first packet arrives
             continue
-# ===================================================
 
-#         # Scan response packets carry the hub name but no manufacturer data.
-#         # Extract and store the name, then move on — nothing to print.
-#         if adv_type == 4:
-#             if addr_bytes in _hub_registry:
-#                 name = find_local_name(payload)
-#                 if name:
-#                     update_hub_name(addr_bytes, name)
-#             continue
+        if name_ and addr_bytes in _hub_registry:
+            update_hub_name(addr_bytes, name_)
 
         result = parse_pybricks(payload)
         if result is None:
             continue
 
-        channel, _, decoded = result
+        channel, decoded = result
 
         # Ensure registry entry exists before dedup/rssi lookup
         hub_tag_color(addr_bytes)
@@ -542,23 +582,23 @@ def process_queue():
         # this first manufacturer packet.
         if addr_bytes in _name_cache:
             update_hub_name(addr_bytes, _name_cache.pop(addr_bytes))
-            
+
         # Skip printing if value hasn't changed since last time (when dedup is on).
         # Key uses cached addr_string + channel to avoid tuple allocation per packet.
-        tag, color, _, name, addr_s = _hub_registry[addr_bytes]
         if SUPPRESS_DUPLICATES:
-            key = addr_s + str(channel)
+            addr_s_ = _hub_registry[addr_bytes][4]
+            key = addr_s_ + str(channel)
             if _last_value.get(key) == decoded:
                 continue
             _last_value[key] = decoded
-
-        ema          = update_rssi_ema(addr_bytes, rssi)
-        signal       = f"{rssi_label(ema)} {int(ema):4d}dBm"
-        colored_addr = f"{color}{addr_s}{ANSI_RESET}"
-        display_name = f" {name}" if name else ""
-        _elaps       = time.ticks_diff(time.ticks_ms(), _t_start) // 1000
+        
+        _t0 = time.ticks_ms()
         _print_count[0] += 1
-        print(f"{_elaps:8d}s {colored_addr} [{tag}]{display_name:<12} {channel:>3} {signal} {decoded}")
+        print(_format_line(addr_bytes, rssi, channel, decoded))
+        _dur = time.ticks_diff(time.ticks_ms(), _t0)
+        if _dur > 200:
+            # Use a short message to avoid making it worse
+            print(f"  --- print blocked {_dur}ms qlen={len(_queue)}")
 
 
 def bt_irq(event, data):
@@ -570,23 +610,17 @@ def bt_irq(event, data):
     to avoid filling the queue with name packets from unregistered devices.
     """
     if event == 5:   # _IRQ_SCAN_RESULT
-        _, addr, adv_type, rssi, adv_data = data
+        _, addr_, adv_type, rssi, adv_data = data
         _irq_count[0] += 1
-
-#         if adv_type == 4:   # scan response — queue for known hubs only
-#             if bytes(addr) in _hub_registry:
-#                 _queue_count[0] += 1
-#                 _queue.append((bytes(addr), bytes(adv_data), int(rssi), int(adv_type)))
-#             return
 
         if adv_type == 4:   # scan response — queue all, filter in process_queue
             _queue_count[0] += 1
-            _queue.append((bytes(addr), bytes(adv_data), int(rssi), 4))
+            _queue.append((bytes(addr_), bytes(adv_data), int(rssi), 4))
             return
         # Manufacturer advertisement — pre-filter for Pybricks ID
         if contains_pybricks_id(adv_data):
             _queue_count[0] += 1
-            _queue.append((bytes(addr), bytes(adv_data), int(rssi), int(adv_type)))
+            _queue.append((bytes(addr_), bytes(adv_data), int(rssi), int(adv_type)))
 
     elif event == 6:   # _IRQ_SCAN_DONE
         if scan_is_running and not _intentional_restart:
@@ -635,13 +669,12 @@ try:
                           f"irq={_irq_count[0]}  queued={_queue_count[0]}  "
                           f"printed={_print_count[0]} ---")
 
-                # global _intentional_restart
                 _intentional_restart = True
                 ble.gap_scan(None)
                 ble.gap_scan(SCAN_DURATION_MS, SCAN_INTERVAL_US, SCAN_WINDOW_US, SCAN_ACTIVE)
                 _intentional_restart = False
                 _last_irq_count[0] = _irq_count[0]   # reset baseline
-                _last_irq_check    = now             # reset watchdog too
+                _last_irq_check = now                # reset watchdog too
 
         # --- Watchdog ---
         # Check every WATCHDOG_SEC seconds whether the IRQ is still firing.
@@ -675,7 +708,7 @@ try:
             print_detail_header()  # repeat the header for readability
 
         time.sleep_ms(20)   # was 100ms; tighter loop drains queue faster
-                            # at 10 hubs × 250ms = 40 pkt/s, 20ms = ~1 pkt/iteration
+        #                     at 10 hubs × 250ms = 40 pkt/s, 20ms = ~1 pkt/iteration
 
 except KeyboardInterrupt:
     scan_is_running = False
@@ -685,26 +718,23 @@ finally:
     ble.active(False)
 
     # --- Final statistics ---
-    elapsed  = time.ticks_diff(time.ticks_ms(), _t_start) // 1000
-    drops    = _queue_count[0] - _processed_count[0]
+    elapsed = time.ticks_diff(time.ticks_ms(), _t_start) // 1000
+    drops = _queue_count[0] - _processed_count[0]
     hrs, rem = divmod(elapsed, 3600)
     mins, sec = divmod(rem, 60)
     print(f"\nScan stopped after {hrs:02d}:{mins:02d}:{sec:02d}")
     print(f"  BLE events received : {_irq_count[0]:>8d}")
-    print(f"  Pybricks packets    : {_queue_count[0]:>8d}  ({100 * _queue_count[0] // max(_irq_count[0], 1)}% of events)")
+    print(f"  Pybricks packets    : {_queue_count[0]:>8d}",
+          f"  ({100 * _queue_count[0] // max(_irq_count[0], 1)}% of events)")
     print(f"  Packets processed   : {_processed_count[0]:>8d}")
     print(f"  Deduped (suppressed): {_processed_count[0] - _print_count[0]:>8d}")
     print(f"  Lines printed       : {_print_count[0]:>8d}")
-    print(f"  Queue drops         : {drops:>8d}{'  *** packets lost!' if drops > 0 else '  (none)'}")
+    _lost = '  *** packets lost!' if drops > 0 else '  (none)'
+    print(f"  Queue drops         : {drops:>8d}{_lost}")
     print(f"  Hubs seen           : {_hub_counter[0]:>8d}")
     for addr, entry in _hub_registry.items():
-        tag, color, ema, name, addr_s = entry
+        tag, _, _, name, addr_s = entry  # color and ema not used here
         label = f" ({name})" if name else ""
         print(f"    [{tag}] {addr_s}{label}")
 
-
-# Clean up — stop the scan and turn off the BLE radio
-# ble.gap_scan(None)
-# ble.active(False)
 print("\nScan stopped.")
-
