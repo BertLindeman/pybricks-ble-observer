@@ -129,12 +129,10 @@ WATCHDOG_SEC = 10
 # flush the BLE chip's internal event buffer before it fills up and stalls.
 # Set to 0 to disable.
 
-PREVENTIVE_RESTART_EVENTS = 6000    # was 6000 on 100% duty-cycle - too high. On 50% OK
+PREVENTIVE_RESTART_EVENTS = 1200    # was 6000 - too high
 # at ~120 IRQ events/sec ambient noise caused restarts every ~1s,
 # colliding with hub boot-time name packets.
 # 6000 ≈ 50s between restarts, giving hubs time to send their name.
-# If using higher duty-cycle (with SCAN_WINDOW_US above) it may be needed 
-# to lower PREVENTIVE_RESTART_EVENTS significally.
 
 # Debug mode: show heartbeat, watchdog, and restart messages.
 # Set to False for clean output with data lines only.

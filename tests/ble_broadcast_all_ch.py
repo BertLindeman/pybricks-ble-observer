@@ -1,8 +1,8 @@
 
 from pybricks.hubs import ThisHub
-from pybricks.tools import wait, StopWatch
-from pybricks import version 
-from pybricks.parameters import Color 
+from pybricks.tools import wait
+from pybricks import version
+from pybricks.parameters import Color
 
 print(version)
 

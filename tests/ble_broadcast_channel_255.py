@@ -1,10 +1,10 @@
 # Best transfer if NO bluetooth connection is active to the computer
 
-broadcast_interval = 250
-
 from pybricks.hubs import ThisHub
-from pybricks.parameters import Color 
+from pybricks.parameters import Color
 from pybricks.tools import wait, StopWatch
+
+BROADCAST_INTERVAL = 500
 
 hub = ThisHub(broadcast_channel=255)
 watch = StopWatch()
@@ -23,4 +23,4 @@ while True:
         else:
             hub.light.on(Color.GREEN)
 
-        wait(broadcast_interval - watch.time())
+        wait(BROADCAST_INTERVAL - watch.time())
